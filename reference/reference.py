@@ -41,6 +41,8 @@ class ReferenceViewer(QWidget):
 		self.zoom = 1.0
 		self.initialZoom = 1.0
 		self.oldZoom = None
+		self.rotation = 0.0
+		self.oldRotation = 0.0
 
 		self.origin = QPoint(0, 0)
 		self.oldOrigin = None
@@ -49,13 +51,19 @@ class ReferenceViewer(QWidget):
 		self.moving = False
 		self.currentColor = None
 		self.picking = None
+		self.transform = None
 
 	def getCurrentColor(self, event):
 		if not self.image.isNull():
-			pos = (event.pos() - self.origin) / self.zoom
+			pos = event.pos()
+			if self.transform is not None:
+				pos = self.transform.map(pos)
 			return self.image.pixelColor(pos)
-
 		return None
+
+	def rotatePoint(self, pos, rad):
+		pos.setX( int(pos.x()*math.cos(rad)-pos.y()*math.sin(rad)) )
+		pos.setY( int(pos.x()*math.sin(rad)+pos.y()*math.cos(rad)) )
 
 	def setImage(self, image=QImage()):
 		self.image = image
@@ -66,12 +74,13 @@ class ReferenceViewer(QWidget):
 		self.sliderReset.emit(float(self.zoom/self.initialZoom))
 
 	def resetView(self):
+		self.rotation = 0.0
 		if self.image.isNull():
 			self.update()
 			return
 		self.initialZoom = min(self.size().width() / self.image.size().width(),
 						self.size().height() / self.image.size().height())
-		self.minimumZoom = self.initialZoom*0.25 # Scaling with really small sizes slows down Krita
+		self.minimumZoom = self.initialZoom*0.25
 		self.zoom = self.initialZoom
 		overflow = self.size() - (self.image.size() * self.zoom)
 		self.origin = QPoint(int(overflow.width() / 2), int(overflow.height() / 2))
@@ -84,11 +93,22 @@ class ReferenceViewer(QWidget):
 
 		painter = QPainter(self)
 		painter.setRenderHint(QPainter.Antialiasing)
+		painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
-		rect = QRect(-self.origin / self.zoom, self.size() / self.zoom)
-		cropped = self.image.copy(rect)
-		image = cropped.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-		painter.drawImage(0, 0, image)
+		# image.copy is expensive. It slows down Krita when scaling to small sizes.
+
+		painter.translate(self.getCenter())
+		painter.rotate(self.rotation)
+		painter.translate(-self.getCenter())
+
+		painter.translate(self.origin)
+		painter.scale(self.zoom, self.zoom)
+
+		painter.drawImage(0, 0, self.image)
+
+		self.transform = painter.worldTransform()
+
+		painter.resetTransform()
 
 		if self.picking is not None:
 			painter.setPen(QPen(QColor(255, 255, 255, 128), 3.0))
@@ -99,6 +119,7 @@ class ReferenceViewer(QWidget):
 		self.pressedPoint = event.pos()
 		self.oldOrigin = self.origin
 		self.oldZoom = self.zoom
+		self.oldRotation = self.rotation
 		if self.picking is not None:
 			self.colorPicked.emit(self.currentColor)
 		self.update()
@@ -121,13 +142,24 @@ class ReferenceViewer(QWidget):
 				self.picking = None
 			if self.moving and self.picking is None:
 				if QApplication.keyboardModifiers() & Qt.ControlModifier:
+					self.oldRotation = self.rotation
 					zoomDelta = self.pressedPoint.y() - event.pos().y()
 					centerPos = (self.pressedPoint - self.oldOrigin) / self.oldZoom
 					self.zoom = self.clampZoom(self.oldZoom + (zoomDelta / 100) * self.oldZoom)
 					self.origin = self.pressedPoint - (centerPos * self.zoom)
 					self.resetSlider()
+				elif QApplication.keyboardModifiers() & Qt.ShiftModifier:
+					rotateDelta = self.getCenter() - event.pos()
+					rotateTheta = math.atan2(rotateDelta.y(), rotateDelta.x())
+					rotateDelta = self.getCenter() - self.pressedPoint
+					rotateTheta = rotateTheta - math.atan2(rotateDelta.y(), rotateDelta.x())
+					self.rotation = self.oldRotation + math.degrees(rotateTheta)
 				else:
-					self.origin = self.oldOrigin - self.pressedPoint + event.pos()
+					self.oldRotation = self.rotation
+					dragDelta = self.pressedPoint - event.pos()
+					rotate = QTransform()
+					rotate.rotate(-self.rotation)
+					self.origin = self.oldOrigin - rotate.map(dragDelta)
 			self.update()
 
 	def wheelEvent(self, event):
@@ -155,11 +187,15 @@ class ReferenceViewer(QWidget):
 		if path.isLocalFile():
 			path = path.toLocalFile() # list of QUrls
 			event.acceptProposedAction()
+			Application.writeSetting('referenceDocker', 'lastref', path)
 			self.setImage(QImage(path))
 		pass
 
+	def getCenter(self):
+		return QPoint(self.size().width(),self.size().height())/2.0
+
 	def changeZoom(self, newZoom, absolute=False, emit=False):
-		thisCenter = (QPoint(self.size().width(),self.size().height())/2.0)
+		thisCenter = self.getCenter()
 		centerPos = (thisCenter - self.origin) / self.zoom
 		if absolute is True:
 			self.zoom = max(.25, newZoom)
